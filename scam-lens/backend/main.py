@@ -1,8 +1,8 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from risk_engine import analyze_message
-
+from image_analyzer import extract_text_from_image
 
 # Create FastAPI application
 app = FastAPI(
@@ -11,11 +11,15 @@ app = FastAPI(
     version="1.0.0"
 )
 
-
 # Allow React frontend to connect
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -27,11 +31,13 @@ class MessageRequest(BaseModel):
     message: str
 
 
-# Home
+# Home endpoint
 @app.get("/")
 def home():
     return {
-        "message": "ScamLens API is running"
+        "status": "online",
+        "message": "ScamLens API is running",
+        "endpoints": ["/analyze", "/analyze-image", "/health"]
     }
 
 
@@ -43,205 +49,46 @@ def health():
     }
 
 
-# Analyze message
+# Analyze text message
 @app.post("/analyze")
 def analyze(request: MessageRequest):
-
-    message = request.message.lower()
-
-    indicators = []
-
-
-    # Check urgency
-    urgency_words = [
-        "urgent",
-        "immediately",
-        "right now",
-        "act now",
-        "last warning",
-        "today",
-        "within 24 hours",
-        "account will be blocked"
-    ]
-
-    for word in urgency_words:
-        if word in message:
-            indicators.append({
-                "type": "Urgency",
-                "description": f"Urgency language detected: '{word}'"
-            })
+    if not request.message or not request.message.strip():
+        raise HTTPException(status_code=400, detail="Message cannot be empty.")
+    
+    result = analyze_message(request.message)
+    return result
 
 
-    # Check OTP
-    otp_words = [
-        "otp",
-        "one time password",
-        "verification code",
-        "security code"
-    ]
-
-    for word in otp_words:
-        if word in message:
-            indicators.append({
-                "type": "Credential Request",
-                "description": f"Sensitive verification information requested: '{word}'"
-            })
-
-
-    # Check password
-    password_words = [
-        "password",
-        "login password",
-        "account password"
-    ]
-
-    for word in password_words:
-        if word in message:
-            indicators.append({
-                "type": "Credential Request",
-                "description": "Password-related information is being requested."
-            })
-
-
-    # Check money
-    money_words = [
-        "payment",
-        "pay",
-        "transfer money",
-        "send money",
-        "₹",
-        "rs.",
-        "refund"
-    ]
-
-    for word in money_words:
-        if word in message:
-            indicators.append({
-                "type": "Financial Request",
-                "description": "The message contains a financial request."
-            })
-
-
-    # Check suspicious actions
-    action_words = [
-        "click",
-        "verify",
-        "login",
-        "update your account",
-        "confirm your account"
-    ]
-
-    for word in action_words:
-        if word in message:
-            indicators.append({
-                "type": "Suspicious Action",
-                "description": f"User is asked to '{word}'."
-            })
-
-
-    # Calculate risk
-    indicator_count = len(indicators)
-
-
-    if indicator_count >= 4:
-
-        risk = "HIGH"
-
-        title = "Potential scam or phishing attempt"
-
-        explanation = (
-            "Several high-risk indicators were detected. "
-            "The message appears to use techniques commonly "
-            "associated with social engineering or phishing."
-        )
-
-        action = (
-            "Do not click links, send money, or share "
-            "passwords, OTPs, or other sensitive information. "
-            "Verify the request through an official channel."
-        )
-
-
-    elif indicator_count >= 2:
-
-        risk = "MEDIUM"
-
-        title = "Suspicious message"
-
-        explanation = (
-            "The message contains multiple indicators "
-            "that deserve additional verification."
-        )
-
-        action = (
-            "Pause before responding. Verify the sender "
-            "and request independently."
-        )
-
-
-    else:
-
-        risk = "LOW"
-
-        title = "No major warning indicators detected"
-
-        explanation = (
-            "The current analysis did not identify enough "
-            "warning indicators to classify this message "
-            "as highly suspicious."
-        )
-
-        action = (
-            "Continue to be cautious with unexpected "
-            "messages and verify important requests."
-        )
-
-
-    # Return result
-    return {
-        "risk": risk,
-        "title": title,
-        "explanation": explanation,
-        "indicator_count": indicator_count,
-        "indicators": indicators,
-        "action": action
-    }
-
+# Analyze screenshot/image
 @app.post("/analyze-image")
 async def analyze_image(file: UploadFile = File(...)):
-
-    # Read uploaded image
+    # Read uploaded image bytes
     image_bytes = await file.read()
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
 
-    return {
-        "filename": file.filename,
-        "message": "Image received successfully",
-        "size": len(image_bytes)
-    }
+    # Extract text from the image
+    extracted_text = extract_text_from_image(image_bytes, file.filename or "")
 
-@app.post("/analyze")
-def analyze(request: MessageRequest):
+    if not extracted_text:
+        return {
+            "filename": file.filename,
+            "extracted_text": "",
+            "message": "No readable text could be extracted from this image. Try pasting the message text directly.",
+            "risk": "LOW",
+            "score": 0,
+            "title": "No text detected in screenshot",
+            "explanation": "ScamLens could not detect any readable text, SMS, or link in the uploaded image.",
+            "action": "Ensure the screenshot is clear and in focus, or copy and paste the message into the text investigator.",
+            "indicator_count": 0,
+            "indicators": [],
+            "urls": [],
+            "url_analysis": []
+        }
 
-    result = analyze_message(request.message)
+    # Run full scam analysis on the extracted text
+    analysis = analyze_message(extracted_text)
+    analysis["filename"] = file.filename
+    analysis["extracted_text"] = extracted_text
 
-    return {
-
-        "risk":
-            result["risk"],
-
-        "score":
-            result["score"],
-
-        "indicator_count":
-            len(result["indicators"]),
-
-        "indicators":
-            result["indicators"],
-
-        "urls":
-            result["urls"],
-
-        "url_analysis":
-            result["url_analysis"]
-
-    }
+    return analysis
